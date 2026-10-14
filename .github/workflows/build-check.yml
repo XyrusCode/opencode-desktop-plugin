@@ -1,0 +1,42 @@
+name: Build Check
+
+# Quick compile check on PRs and pushes to feature branches.
+# Builds the Windows target only; sidecar placeholder binaries are needed
+# because tauri_build validates externalBin paths at compile time.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Download sidecars
+        shell: pwsh
+        run: |
+          $bin = "src-tauri/binaries"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          # Placeholder binaries are enough for cargo check — the real ones
+          # are only needed at runtime / release packaging.
+          "PLACEHOLDER" | Out-File -FilePath "$bin/yt-dlp-x86_64-pc-windows-msvc.exe" -Encoding ascii -NoNewline
+          "PLACEHOLDER" | Out-File -FilePath "$bin/ffmpeg-x86_64-pc-windows-msvc.exe" -Encoding ascii -NoNewline
+          Get-ChildItem $bin
+
+      - name: Cargo check
+        working-directory: src-tauri
+        run: cargo check
+
+      - name: Run Python tests
+        run: python -m pytest test_bridge_server.py -v
+        # Alternatively: python test_bridge_server.py
