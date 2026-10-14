@@ -1,0 +1,190 @@
+name: Release
+
+# Releases are driven by the version number: bumping `version` in
+# src-tauri/tauri.conf.json and landing it on main auto-triggers a build and
+# publishes v<version>. The `check` job makes this idempotent — it only
+# releases when no release for that version exists yet, so unrelated edits to
+# the config (or re-runs) never re-release. `workflow_dispatch` allows a manual
+# run for the current version if a release attempt needs to be retried.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      release: ${{ steps.resolve.outputs.release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version and whether it needs releasing
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r '.version' src-tauri/tauri.conf.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Release v$version already exists — nothing to do."
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "New version v$version — a release will be built."
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            triple: x86_64-pc-windows-msvc
+            bundles: nsis
+          - platform: macos-15-intel
+            triple: x86_64-apple-darwin
+            bundles: dmg
+          - platform: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+            bundles: deb
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Download sidecars (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "src-tauri/binaries"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile "$bin/yt-dlp-${{ matrix.triple }}.exe"
+          Invoke-WebRequest `
+            -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-lgpl.zip" `
+            -OutFile "$env:RUNNER_TEMP/ffmpeg.zip"
+          Expand-Archive "$env:RUNNER_TEMP/ffmpeg.zip" -DestinationPath "$env:RUNNER_TEMP/ffmpeg" -Force
+          $ff = (Get-ChildItem "$env:RUNNER_TEMP/ffmpeg" -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName
+          Copy-Item $ff "$bin/ffmpeg-${{ matrix.triple }}.exe"
+          Get-ChildItem $bin
+
+      - name: Download sidecars (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bin="src-tauri/binaries"
+          mkdir -p "$bin"
+          # yt-dlp: universal macOS binary
+          curl -fL --retry 5 --retry-all-errors `
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" `
+            -o "$bin/yt-dlp-${{ matrix.triple }}"
+          # ffmpeg: static Intel build from evermeet.cx
+          curl -fL --retry 5 --retry-all-errors `
+            "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o "$RUNNER_TEMP/ffmpeg.zip"
+          unzip -o "$RUNNER_TEMP/ffmpeg.zip" -d "$RUNNER_TEMP/ffmpeg"
+          cp "$RUNNER_TEMP/ffmpeg/ffmpeg" "$bin/ffmpeg-${{ matrix.triple }}"
+          chmod +x "$bin/yt-dlp-${{ matrix.triple }}" "$bin/ffmpeg-${{ matrix.triple }}"
+          ls -la "$bin"
+
+      - name: Download sidecars (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bin="src-tauri/binaries"
+          mkdir -p "$bin"
+          # yt-dlp: x86_64 linux binary
+          curl -fL --retry 5 --retry-all-errors `
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux" `
+            -o "$bin/yt-dlp-${{ matrix.triple }}"
+          # ffmpeg: static linux64 build from BtbN (GitHub-hosted, LGPL)
+          curl -fL --retry 5 --retry-all-errors `
+            "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-lgpl.tar.xz" `
+            -o "$RUNNER_TEMP/ffmpeg.tar.xz"
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xf "$RUNNER_TEMP/ffmpeg.tar.xz" -C "$RUNNER_TEMP/ffmpeg"
+          cp "$(find "$RUNNER_TEMP/ffmpeg" -type f -name ffmpeg | head -1)" "$bin/ffmpeg-${{ matrix.triple }}"
+          chmod +x "$bin/yt-dlp-${{ matrix.triple }}" "$bin/ffmpeg-${{ matrix.triple }}"
+          ls -la "$bin"
+
+      - name: Extract release notes
+        id: notes
+        shell: bash
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          body=$(awk -v v="$version"
+            BEGIN { found = 0 }
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ ("^## \\[" v "\\]")) { found = 1; next }
+            }
+            found { print }
+          ' CHANGELOG.md)
+          if [ -z "$body" ]; then
+            body="No release notes available for v$version."
+          fi
+          {
+            echo "body<<EOF"
+            echo "$body"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # tauri-action creates the git tag and the GitHub release from this
+          # name; every matrix job passes the same tag, so they publish into one
+          # release. The version comes from the check job, not a pushed tag.
+          tagName: v${{ needs.check.outputs.version }}
+          releaseName: "opencode v${{ needs.check.outputs.version }}"
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis
+          updaterJsonPreferNsis: true
+
+      mirror:
+        needs: [release, check]
+        runs-on: ubuntu-latest
+        steps:
+          - name: Download release assets
+            env:
+              GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          run: |
+            mkdir -p dist
+            gh release download "v${{ needs.check.outputs.version }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir dist
+
+          - name: Upload to Cloudflare R2
+            env:
+              CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          run: |
+            npm install -g wrangler
+            for f in dist/*; do
+              wrangler r2 object put "video-plucker-releases/desktop/v${{ needs.check.outputs.version }}/$(basename "$f")" --file "$f" --remote
+            done
+
+          - name: Mirror info
+            run: echo "Mirrored to R2: desktop/v${{ needs.check.outputs.version }}/"
