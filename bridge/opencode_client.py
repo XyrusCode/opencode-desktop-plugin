@@ -71,9 +71,14 @@ class OpencodeClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        directory: str | None = None,
     ) -> Any:
         query = dict(params or {})
-        if self.workdir:
+        # A per-call directory overrides the client's default workdir; this is
+        # how the phone creates a session in a project it picked.
+        if directory is not None:
+            query.setdefault("directory", directory)
+        elif self.workdir:
             query.setdefault("directory", self.workdir)
         try:
             async with self._http.request(
@@ -118,11 +123,11 @@ class OpencodeClient:
         data = await self._request("GET", "/session", params={"limit": limit})
         return data if isinstance(data, list) else []
 
-    async def create_session(self, *, title: str = "") -> dict[str, Any]:
+    async def create_session(self, *, title: str = "", directory: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {}
         if title:
             body["title"] = title
-        data = await self._request("POST", "/session", json_body=body)
+        data = await self._request("POST", "/session", json_body=body, directory=directory)
         if not isinstance(data, dict) or not data.get("id"):
             raise OpencodeError(f"opencode returned an unusable session: {data!r}")
         return data
@@ -131,21 +136,77 @@ class OpencodeClient:
         data = await self._request("GET", f"/session/{session_id}/message")
         return data if isinstance(data, list) else []
 
-    async def prompt(self, session_id: str, text: str) -> None:
-        """Send a prompt. Returns as soon as opencode accepts it.
+    async def prompt(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        model: dict[str, Any] | None = None,
+        agent: str | None = None,
+    ) -> None:
+        """Send a prompt, optionally over-riding the model or agent.
 
         prompt_async is deliberate: the synchronous /message variant holds the
         request open for the whole generation, which would block the phone's
         command and make streaming impossible.
+
+        The /api/session/{id}/model and /agent setters return 500 on current
+        builds, so per-message model/agent selection is done in the body here;
+        opencode latches it onto the resulting session after the turn.
         """
+        body: dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        if model:
+            body["model"] = model  # {providerID, modelID}
+        if agent:
+            body["agent"] = agent
         await self._request(
             "POST",
             f"/session/{session_id}/prompt_async",
-            json_body={"parts": [{"type": "text", "text": text}]},
+            json_body=body,
         )
 
     async def abort(self, session_id: str) -> None:
         await self._request("POST", f"/session/{session_id}/abort")
+
+    # --- catalog + prompts --------------------------------------------------
+
+    async def list_providers(self) -> list[dict[str, Any]]:
+        """Configured providers with their models. opencode wraps them in `all`."""
+        data = await self._request("GET", "/provider")
+        if isinstance(data, dict) and isinstance(data.get("all"), list):
+            return data["all"]
+        return data if isinstance(data, list) else []
+
+    async def list_agents(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/agent")
+        return data if isinstance(data, list) else []
+
+    async def list_projects(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/project")
+        return data if isinstance(data, list) else []
+
+    async def list_permissions(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/permission")
+        return data if isinstance(data, list) else []
+
+    async def list_questions(self) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/question")
+        return data if isinstance(data, list) else []
+
+    async def reply_permission(
+        self, request_id: str, reply: str, message: str | None = None
+    ) -> bool:
+        body: dict[str, Any] = {"reply": reply}
+        if message:
+            body["message"] = message
+        result = await self._request("POST", f"/permission/{request_id}/reply", json_body=body)
+        return bool(result)
+
+    async def reply_question(self, request_id: str, answers: list[list[str]]) -> bool:
+        result = await self._request(
+            "POST", f"/question/{request_id}/reply", json_body={"answers": answers}
+        )
+        return bool(result)
 
     # --- events ----------------------------------------------------------
 

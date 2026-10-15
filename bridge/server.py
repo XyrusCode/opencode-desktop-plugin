@@ -24,6 +24,9 @@ from .opencode_client import OpencodeClient, OpencodeError
 log = logging.getLogger(__name__)
 
 AUTH_TIMEOUT_SECONDS = 10.0
+# How often the bridge polls opencode for pending permission/question prompts.
+# A poll is the reliable floor; push over the event stream is a fast path.
+PROMPT_POLL_SECONDS = 2.0
 # opencode sends a heartbeat; these are noise once translated to phone frames.
 _IGNORED_EVENT_TYPES = {"server.connected", "server.heartbeat"}
 
@@ -37,7 +40,16 @@ class BridgeServer:
         self._clients: set[Any] = set()
         self._attached: dict[Any, str] = {}  # socket -> session id
         self._pump: asyncio.Task[None] | None = None
+        self._poll: asyncio.Task[None] | None = None
         self._server: Any = None
+        # Per-socket pending selection. These ride along on the next prompt so
+        # model/agent/project act like a session-level override from the phone.
+        self._model: dict[Any, dict[str, Any]] = {}
+        self._agent: dict[Any, str | None] = {}
+        self._project_dir: dict[Any, str | None] = {}
+        # Prompt IDs already surfaced to the phone, so each is delivered once.
+        self._seen_permissions: set[str] = set()
+        self._seen_questions: set[str] = set()
 
     # --- lifecycle -------------------------------------------------------
 
@@ -46,17 +58,21 @@ class BridgeServer:
         async with websockets.serve(self._handle, host, port):
             log.info("bridge listening on ws://%s:%d", host, port)
             self._pump = asyncio.create_task(self._pump_events())
+            self._poll = asyncio.create_task(self._poll_prompts())
             try:
                 await asyncio.Future()
             finally:
                 await self.shutdown()
 
     async def shutdown(self) -> None:
-        if self._pump is not None:
-            self._pump.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._pump
-            self._pump = None
+        for task in (self._pump, self._poll):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                # Only _pump needs resetting; _poll is re-checked via the loop.
+        self._pump = None
+        self._poll = None
         for socket in list(self._clients):
             with contextlib.suppress(Exception):
                 await socket.close()
@@ -111,6 +127,9 @@ class BridgeServer:
         self._clients.add(socket)
         log.info("auth ok for %s", peer)
         await self._send(socket, {"type": p.WELCOME, "message": "authenticated"})
+        # Push the model/agent catalogs up front so the phone can populate its
+        # pickers before the user starts a session.
+        await self._send_catalogs(socket)
 
         try:
             async for raw in socket:
@@ -145,7 +164,8 @@ class BridgeServer:
                 )
             elif kind == p.CREATE_SESSION:
                 title = frame.get("title") or ""
-                session = await self._client.create_session(title=title)
+                directory = frame.get("directory") or self._project_dir.get(socket)
+                session = await self._client.create_session(title=title, directory=directory)
                 self._attached[socket] = session["id"]
                 await self._send(
                     socket,
@@ -155,6 +175,7 @@ class BridgeServer:
                         "session": p.session_summary(session),
                     },
                 )
+                await self._push_projects(socket)
             elif kind == p.ATTACH:
                 session_id = p.require(frame, "sessionID")
                 messages = await self._client.get_messages(session_id)
@@ -164,6 +185,31 @@ class BridgeServer:
                     socket,
                     {"type": p.SESSION, "kind": "attached", "sessionID": session_id},
                 )
+                await self._push_projects(socket)
+            elif kind == p.SELECT_MODEL:
+                session_id = frame.get("sessionID") or self._attached.get(socket)
+                if not session_id:
+                    await self._send(socket, p.error("attach before selecting a model"))
+                    return
+                model = p.require(frame, "modelID")
+                provider = p.require(frame, "providerID")
+                self._model[socket] = {"modelID": model, "providerID": provider}
+                await self._send(
+                    socket, p.model_frame(session_id, model_id=model, provider_id=provider)
+                )
+            elif kind == p.SELECT_AGENT:
+                self._agent[socket] = p.require(frame, "agent")
+            elif kind == p.PICK_PROJECT:
+                # Remembered per-socket; the next CREATE_SESSION lands here.
+                self._project_dir[socket] = p.require(frame, "worktree")
+            elif kind == p.REPLY_PERMISSION:
+                request_id = p.require(frame, "requestID")
+                reply = p.require(frame, "reply")
+                await self._client.reply_permission(request_id, reply, frame.get("message"))
+            elif kind == p.REPLY_QUESTION:
+                request_id = p.require(frame, "requestID")
+                answers = p.require(frame, "answers")
+                await self._client.reply_question(request_id, answers)
             elif kind == p.PROMPT:
                 text = p.require(frame, "text")
                 session_id = frame.get("sessionID") or self._attached.get(socket)
@@ -173,7 +219,13 @@ class BridgeServer:
                     )
                     return
                 self._attached[socket] = session_id
-                await self._client.prompt(session_id, text)
+                # Apply any model/agent the phone selected; per-message override
+                # is the only setter that works on current opencode builds.
+                prompt_model = self._model.pop(socket, None)
+                prompt_agent = self._agent.pop(socket, None)
+                await self._client.prompt(
+                    session_id, text, model=prompt_model, agent=prompt_agent
+                )
             elif kind == p.ABORT:
                 session_id = frame.get("sessionID") or self._attached.get(socket)
                 if not session_id:
@@ -215,3 +267,49 @@ class BridgeServer:
                 log.warning("opencode event stream dropped (%s); retry in %.0fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    # --- prompts: poll + stream push ---------------------------------------
+
+    async def _poll_prompts(self) -> None:
+        """Surface interactive prompts by polling opencode.
+
+        A poll is the reliable floor: `POST /permission` and `/question` list
+        pending prompts, and each is delivered once per session. If opencode
+        also pushes them as events on the stream (see translate_opencode_event),
+        they arrive faster via _pump_events instead -- but the poller guarantees
+        correctness regardless of whether push is implemented.
+        """
+        while True:
+            try:
+                await asyncio.sleep(PROMPT_POLL_SECONDS)
+                perms = await self._client.list_permissions()
+                qs = await self._client.list_questions()
+                for request in perms:
+                    rid = request.get("id")
+                    if rid in self._seen_permissions:
+                        continue
+                    self._seen_permissions.add(rid)
+                    await self._broadcast(p.permission_prompt_frame(request))
+                for request in qs:
+                    rid = request.get("id")
+                    if rid in self._seen_questions:
+                        continue
+                    self._seen_questions.add(rid)
+                    await self._broadcast(p.question_prompt_frame(request))
+                # Forget IDs the phone has answered so a re-prompt can re-fire.
+                self._seen_permissions &= {r.get("id") for r in perms}
+                self._seen_questions &= {r.get("id") for r in qs}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("prompt poll dropped (%s)", exc)
+                await asyncio.sleep(PROMPT_POLL_SECONDS)
+
+    # --- catalog helpers ----------------------------------------------------
+
+    async def _send_catalogs(self, socket: Any) -> None:
+        await self._send(socket, p.providers_frame(await self._client.list_providers()))
+        await self._send(socket, p.agents_frame(await self._client.list_agents()))
+
+    async def _push_projects(self, socket: Any) -> None:
+        await self._send(socket, p.projects_frame(await self._client.list_projects()))

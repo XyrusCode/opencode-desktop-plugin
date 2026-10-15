@@ -27,13 +27,45 @@ class FakeOpencode:
     def __init__(self) -> None:
         self.sessions: dict[str, dict[str, Any]] = {}
         self.messages: dict[str, list[dict[str, Any]]] = {}
-        self.prompts: list[tuple[str, str]] = []
+        self.prompts: list[dict[str, Any]] = []
         self.aborted: list[str] = []
         self._subscribers: set[asyncio.Queue[str]] = set()
         self._closing = False
         self._next_session = 0
         self._runner: web.AppRunner | None = None
         self.port: int = 0
+
+        # Catalog data the bridge can serve to the phone.
+        self.providers = [
+            {
+                "id": "openai",
+                "name": "OpenAI",
+                "models": {
+                    "gpt-4o": {
+                        "id": "gpt-4o",
+                        "name": "GPT-4o",
+                        "providerID": "openai",
+                    }
+                },
+            }
+        ]
+        self.agents = [{"name": "build", "description": "default agent", "native": True}]
+        self.projects = [
+            {
+                "id": "proj_1",
+                "name": "marcuscassel.org",
+                "worktree": "/srv/marcuscassel.org",
+                "vcs": "git",
+                "icon": {"url": "data:image/png;base64,ZmFrZQ=="},
+            }
+        ]
+        # Pending interactive prompts the poller should surface.
+        self.permissions: list[dict[str, Any]] = []
+        self.questions: list[dict[str, Any]] = []
+
+        # When True, the fake emits a finalized tool part in the prompt stream so
+        # the bridge's part-forwarding can be exercised end to end.
+        self.emit_tool = False
 
     # --- helpers used by tests -------------------------------------------
 
@@ -56,6 +88,12 @@ class FakeOpencode:
         for queue in list(self._subscribers):
             queue.put_nowait(payload)
 
+    def add_permission(self, request: dict[str, Any]) -> None:
+        self.permissions.append(request)
+
+    def add_question(self, request: dict[str, Any]) -> None:
+        self.questions.append(request)
+
     # --- routes ----------------------------------------------------------
 
     async def _health(self, _request: web.Request) -> web.Response:
@@ -66,7 +104,10 @@ class FakeOpencode:
 
     async def _create_session(self, request: web.Request) -> web.Response:
         body = await request.json() if request.can_read_body else {}
+        directory = request.query.get("directory")
         sid = self.add_session(body.get("title", ""))
+        if directory:
+            self.sessions[sid]["directory"] = directory
         return web.json_response(self.sessions[sid])
 
     async def _get_messages(self, request: web.Request) -> web.Response:
@@ -77,14 +118,21 @@ class FakeOpencode:
         sid = request.match_info["sessionID"]
         body = await request.json()
         text = "".join(p.get("text", "") for p in body.get("parts", []))
-        self.prompts.append((sid, text))
+        self.prompts.append(
+            {
+                "sid": sid,
+                "text": text,
+                "model": body.get("model"),
+                "agent": body.get("agent"),
+            }
+        )
 
         message_id = f"msg_fake{len(self.prompts):04d}"
         self.messages.setdefault(sid, []).append(
             {"info": {"id": message_id, "role": "user"}, "parts": [{"type": "text", "text": text}]}
         )
 
-        # Echo the text back as deltas, then finish. Mirrors opencode's shape.
+        # Echo the text back as deltas, then finish, mirroring opencode's shape.
         self.emit(
             {
                 "type": "message.updated",
@@ -121,6 +169,26 @@ class FakeOpencode:
                 },
             }
         )
+
+        if self.emit_tool:
+            self.emit(
+                {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "sessionID": sid,
+                        "part": {
+                            "id": "prt_tool",
+                            "type": "tool",
+                            "messageID": message_id,
+                            "callID": "call_fake",
+                            "tool": "bash",
+                            "state": {"result": "ran clean"},
+                            "time": {"start": 1, "end": 2},
+                        },
+                    },
+                }
+            )
+
         self.emit({"type": "session.idle", "properties": {"sessionID": sid}})
         return web.Response(status=204)
 
@@ -128,6 +196,21 @@ class FakeOpencode:
         sid = request.match_info["sessionID"]
         self.aborted.append(sid)
         self.emit({"type": "session.idle", "properties": {"sessionID": sid}})
+        return web.json_response(True)
+
+    async def _list(self, data_attr: str, request: web.Request) -> web.Response:
+        return web.json_response(getattr(self, data_attr))
+
+    async def _reply_permission(self, request: web.Request) -> web.Response:
+        request_id = request.match_info["requestID"]
+        body = await request.json()
+        self.permissions = [p for p in self.permissions if p.get("id") != request_id]
+        return web.json_response(True)
+
+    async def _reply_question(self, request: web.Request) -> web.Response:
+        request_id = request.match_info["requestID"]
+        body = await request.json()
+        self.questions = [q for q in self.questions if q.get("id") != request_id]
         return web.json_response(True)
 
     async def _events(self, request: web.Request) -> web.StreamResponse:
@@ -163,6 +246,13 @@ class FakeOpencode:
         app.router.add_post("/session/{sessionID}/prompt_async", self._prompt_async)
         app.router.add_post("/session/{sessionID}/abort", self._abort)
         app.router.add_get("/event", self._events)
+        app.router.add_get("/provider", lambda r: self._list("providers", r))
+        app.router.add_get("/agent", lambda r: self._list("agents", r))
+        app.router.add_get("/project", lambda r: self._list("projects", r))
+        app.router.add_get("/permission", lambda r: self._list("permissions", r))
+        app.router.add_get("/question", lambda r: self._list("questions", r))
+        app.router.add_post("/permission/{requestID}/reply", self._reply_permission)
+        app.router.add_post("/question/{requestID}/reply", self._reply_question)
 
         self._runner = web.AppRunner(app, shutdown_timeout=1.0)
         await self._runner.setup()
