@@ -1,0 +1,176 @@
+"""Async client for the opencode headless server.
+
+Only the endpoints the bridge actually uses are wrapped. opencode's own OpenAPI
+document lives at ``GET /doc`` on a running server if anything needs adding.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any, AsyncIterator
+
+import aiohttp
+
+log = logging.getLogger(__name__)
+
+
+class OpencodeError(RuntimeError):
+    """opencode was reachable but answered with an error or not at all."""
+
+
+class OpencodeClient:
+    """Thin async wrapper over the opencode HTTP + SSE API."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        workdir: str,
+        token: str = "",
+        timeout: float = 30.0,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.workdir = workdir
+        self._token = token
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._session = session
+        self._owns_session = session is None
+
+    async def __aenter__(self) -> "OpencodeClient":
+        if self._session is None:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._session is not None and self._owns_session:
+            await self._session.close()
+            self._session = None
+
+    @property
+    def _http(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            raise OpencodeError("client is not started; use `async with`")
+        return self._session
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        return headers
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        query = dict(params or {})
+        if self.workdir:
+            query.setdefault("directory", self.workdir)
+        try:
+            async with self._http.request(
+                method,
+                f"{self.base_url}{path}",
+                params=query,
+                json=json_body,
+                headers=self._headers(),
+            ) as resp:
+                if resp.status >= 400:
+                    detail = (await resp.text())[:400]
+                    raise OpencodeError(
+                        f"{method} {path} -> {resp.status}: {detail}"
+                    )
+                if resp.status == 204 or resp.content_length == 0:
+                    return None
+                return await resp.json(content_type=None)
+        except aiohttp.ClientError as exc:
+            raise OpencodeError(f"{method} {path} failed: {exc}") from exc
+
+    # --- health ----------------------------------------------------------
+
+    async def wait_until_ready(self, *, attempts: int = 60, delay: float = 0.5) -> None:
+        """Block until opencode answers /global/health.
+
+        opencode prints its listen line before the HTTP server is actually
+        accepting, so the first probe can fail; retry rather than assume.
+        """
+        last: Exception | None = None
+        for _ in range(attempts):
+            try:
+                await self._request("GET", "/global/health")
+                return
+            except OpencodeError as exc:
+                last = exc
+                await asyncio.sleep(delay)
+        raise OpencodeError(f"opencode never became ready at {self.base_url}: {last}")
+
+    # --- sessions --------------------------------------------------------
+
+    async def list_sessions(self, *, limit: int = 25) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/session", params={"limit": limit})
+        return data if isinstance(data, list) else []
+
+    async def create_session(self, *, title: str = "") -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        if title:
+            body["title"] = title
+        data = await self._request("POST", "/session", json_body=body)
+        if not isinstance(data, dict) or not data.get("id"):
+            raise OpencodeError(f"opencode returned an unusable session: {data!r}")
+        return data
+
+    async def get_messages(self, session_id: str) -> list[dict[str, Any]]:
+        data = await self._request("GET", f"/session/{session_id}/message")
+        return data if isinstance(data, list) else []
+
+    async def prompt(self, session_id: str, text: str) -> None:
+        """Send a prompt. Returns as soon as opencode accepts it.
+
+        prompt_async is deliberate: the synchronous /message variant holds the
+        request open for the whole generation, which would block the phone's
+        command and make streaming impossible.
+        """
+        await self._request(
+            "POST",
+            f"/session/{session_id}/prompt_async",
+            json_body={"parts": [{"type": "text", "text": text}]},
+        )
+
+    async def abort(self, session_id: str) -> None:
+        await self._request("POST", f"/session/{session_id}/abort")
+
+    # --- events ----------------------------------------------------------
+
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        """Yield opencode SSE events forever.
+
+        Uses a session without a total timeout: the stream is long lived by
+        nature, so a request-level timeout would tear it down on its own.
+        """
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+        headers = self._headers()
+        headers["Accept"] = "text/event-stream"
+        async with self._http.get(
+            f"{self.base_url}/event", headers=headers, timeout=timeout
+        ) as resp:
+            if resp.status != 200:
+                raise OpencodeError(f"GET /event -> {resp.status}")
+            async for raw in resp.content:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                try:
+                    yield json.loads(payload)
+                except ValueError:
+                    log.debug("skipping unparseable SSE payload: %s", payload[:120])

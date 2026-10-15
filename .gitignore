@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local config
+.env
+
+# Generated knowledge graph (rebuilt by the graphify hook)
+graphify-out/
