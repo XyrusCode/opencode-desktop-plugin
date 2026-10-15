@@ -149,19 +149,21 @@ jobs:
           name=$(basename "$wheel")
 
           # A 200 from an upload is not proof the bytes landed intact.
+          # Download into a subdirectory: pip parses the wheel filename, so a
+          # roundtrip- prefix on the file itself makes it reject the install.
+          mkdir -p roundtrip
           npx --yes wrangler@4 r2 object get \
             "$R2_BUCKET/$R2_PREFIX/v$VERSION/$name" \
-            --file "roundtrip-$name" --remote
+            --file "roundtrip/$name" --remote
 
-          if ! cmp -s "$wheel" "roundtrip-$name"; then
+          if ! cmp -s "$wheel" "roundtrip/$name"; then
             echo "::error::the object in R2 is not byte identical to the built wheel"
             exit 1
           fi
 
           # Prove the published wheel is actually installable, rather than
           # merely present.
-          pip install --force-reinstall "roundtrip-$name"
-          opencode-bridge --help >/dev/null 2>&1 || true
+          pip install --force-reinstall "roundtrip/$name"
           python -c "import bridge, importlib.metadata as m; print('installed', m.version('opencode-bridge'))"
           echo "R2 object matches the built wheel and installs cleanly."
 
