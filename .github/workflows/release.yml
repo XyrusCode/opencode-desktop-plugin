@@ -1,0 +1,172 @@
+name: Release
+
+# The bridge ships as a wheel so a desktop can install it with one command:
+#   pip install https://<r2>/opencode-bridge-<version>-py3-none-any.whl
+#
+# The GitHub release is the record, the R2 object is the download, matching how
+# wp-disk-guard publishes.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to release, for example v0.2.1"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish ${{ inputs.tag || github.ref_name }}
+    runs-on: ubuntu-latest
+
+    env:
+      # One bucket for every XyrusCode product; the prefix separates them.
+      R2_BUCKET: software-releases
+      R2_PREFIX: opencode/bridge
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Resolve the version
+        id: version
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.ref_name }}'
+          case "$tag" in
+            v*) version="${tag#v}" ;;
+            *) echo "tag must start with v, got $tag" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag (version $version)"
+
+      - name: Test before packaging
+        run: |
+          pip install -e ".[dev]"
+          pytest -q --timeout=60
+
+      - name: Build the wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          pip install --upgrade build
+          python -m build --wheel --outdir dist
+
+          wheel=$(ls dist/opencode_bridge-*.whl)
+          test -n "$wheel" || { echo "::error::no wheel built"; exit 1; }
+
+          # The wheel version must match the tag, or `pip install` on a desktop
+          # silently gets a different version than the release claims.
+          got=$(python -c "import sys,glob;print(glob.glob('dist/*.whl')[0].split('-')[1])")
+          if [ "$got" != "$VERSION" ]; then
+            echo "::error::wheel version $got does not match tag $VERSION"
+            echo "::error::bump version in pyproject.toml to $VERSION"
+            exit 1
+          fi
+          echo "wheel: $wheel"
+
+      - name: Extract the release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          notes=$(awk -v heading="## [$version]" '
+            $0 == heading { found = 1; next }
+            /^## \[/ && found { exit }
+            found { print }
+          ' CHANGELOG.md 2>/dev/null || true)
+          {
+            echo 'notes<<EOF'
+            echo "${notes:-See the commit history for this tag.}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/opencode_bridge-*.whl)
+          # Idempotent, so a re-run after a partial failure repairs the release
+          # instead of stopping on "release already exists".
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$wheel" --clobber
+          else
+            gh release create "$TAG" "$wheel" \
+              --title "opencode bridge $VERSION" \
+              --notes "${{ steps.notes.outputs.notes }}" \
+              --verify-tag
+          fi
+
+      - name: Mirror to Cloudflare R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/opencode_bridge-*.whl)
+
+          # --remote is required: without it wrangler writes to its local
+          # simulator, prints "Upload complete", and nothing reaches R2.
+          npx --yes wrangler@4 r2 object put \
+            "$R2_BUCKET/$R2_PREFIX/v$VERSION/$(basename "$wheel")" \
+            --file "$wheel" --content-type application/octet-stream --remote
+
+          npx --yes wrangler@4 r2 object put \
+            "$R2_BUCKET/$R2_PREFIX/latest/opencode-bridge.whl" \
+            --file "$wheel" --content-type application/octet-stream --remote
+
+      - name: Read the wheel back out of R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/opencode_bridge-*.whl)
+          name=$(basename "$wheel")
+
+          # A 200 from an upload is not proof the bytes landed intact.
+          npx --yes wrangler@4 r2 object get \
+            "$R2_BUCKET/$R2_PREFIX/v$VERSION/$name" \
+            --file "roundtrip-$name" --remote
+
+          if ! cmp -s "$wheel" "roundtrip-$name"; then
+            echo "::error::the object in R2 is not byte identical to the built wheel"
+            exit 1
+          fi
+
+          # Prove the published wheel is actually installable, rather than
+          # merely present.
+          pip install --force-reinstall "roundtrip-$name"
+          opencode-bridge --help >/dev/null 2>&1 || true
+          python -c "import bridge, importlib.metadata as m; print('installed', m.version('opencode-bridge'))"
+          echo "R2 object matches the built wheel and installs cleanly."
+
+      - name: Attach the wheel to this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-bridge
+          path: dist/*.whl
