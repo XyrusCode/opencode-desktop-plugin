@@ -74,7 +74,14 @@ class Config:
 
     @property
     def resolved_workdir(self) -> str:
-        return self.workdir or os.getcwd()
+        """Project directory opencode is scoped to.
+
+        Defaults to the user's home rather than the process cwd: opencode's
+        session list is scoped to the directory it serves, so a cwd default
+        would show an empty list whenever the bridge is started from anywhere
+        arbitrary. Set BRIDGE_WORKDIR to narrow the phone to one project.
+        """
+        return self.workdir or os.path.expanduser("~")
 
 
 def load_config() -> Config:
