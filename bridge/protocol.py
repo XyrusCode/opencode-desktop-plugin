@@ -36,6 +36,10 @@ PICK_PROJECT = "pick_project"
 REPLY_PERMISSION = "reply_permission"
 REPLY_QUESTION = "reply_question"
 
+# Session management from the phone's drawer.
+RENAME_SESSION = "rename_session"
+DELETE_SESSION = "delete_session"
+
 # --- frames the bridge sends ------------------------------------------------
 
 WELCOME = "welcome"

@@ -337,6 +337,63 @@ class TestOpencodeClient:
         assert server.prompts[0]["agent"] == "researcher"
 
 
+class TestSessionManagement:
+    """Rename and delete are the drawer's session actions."""
+
+    async def test_rename_patches_the_title(self, fake_opencode):
+        server, url = fake_opencode
+        sid = server.add_session("before")
+        async with OpencodeClient(url, workdir="C:\\work") as client:
+            updated = await client.rename_session(sid, "after")
+        assert server.patches[0] == {"sid": sid, "title": "after"}
+        assert updated["title"] == "after"
+
+    async def test_delete_removes_the_session(self, fake_opencode):
+        server, url = fake_opencode
+        sid = server.add_session("doomed")
+        async with OpencodeClient(url, workdir="C:\\work") as client:
+            await client.delete_session(sid)
+        assert server.deletes == [sid]
+        assert sid not in server.sessions
+
+    async def test_rename_from_the_phone_is_broadcast(self, bridge):
+        harness, fake = bridge
+        sid = fake.add_session("before")
+        socket = await harness.connect()
+        await _recv_until(socket, lambda f: f["type"] == p.WELCOME)
+        await socket.send(json.dumps({"type": p.RENAME_SESSION, "sessionID": sid, "title": "after"}))
+        frame, _ = await _recv_until(socket, lambda f: f["type"] == p.SESSION and f.get("kind") == "renamed")
+        assert frame["session"]["title"] == "after"
+        assert frame["session"]["id"] == sid
+
+    async def test_rename_rejects_a_blank_title(self, bridge):
+        harness, fake = bridge
+        sid = fake.add_session("t")
+        socket = await harness.connect()
+        await _recv_until(socket, lambda f: f["type"] == p.WELCOME)
+        await socket.send(json.dumps({"type": p.RENAME_SESSION, "sessionID": sid, "title": "   "}))
+        frame = await _recv_until(socket, lambda f: f["type"] == p.ERROR)
+        assert fake.patches == []
+
+    async def test_delete_from_the_phone_detaches_if_reading_it(self, bridge):
+        harness, fake = bridge
+        sid = fake.add_session("doomed")
+        socket = await harness.connect()
+        await _recv_until(socket, lambda f: f["type"] == p.WELCOME)
+        await socket.send(json.dumps({"type": p.ATTACH, "sessionID": sid}))
+        await _recv_until(socket, lambda f: f["type"] == p.HISTORY)
+
+        await socket.send(json.dumps({"type": p.DELETE_SESSION, "sessionID": sid}))
+        frame, _ = await _recv_until(socket, lambda f: f["type"] == p.SESSION and f.get("kind") == "deleted")
+        assert frame["sessionID"] == sid
+        assert fake.deletes == [sid]
+
+        # A prompt now has nowhere to land, so it is refused instead of hanging.
+        await socket.send(json.dumps({"type": p.PROMPT, "text": "hi"}))
+        err, _ = await _recv_until(socket, lambda f: f["type"] == p.ERROR)
+        assert "attach" in err["message"].lower()
+
+
 # --- selectors, catalogs and prompts ----------------------------------------
 
 

@@ -28,6 +28,8 @@ class FakeOpencode:
         self.sessions: dict[str, dict[str, Any]] = {}
         self.messages: dict[str, list[dict[str, Any]]] = {}
         self.prompts: list[dict[str, Any]] = []
+        self.patches: list[dict[str, Any]] = []
+        self.deletes: list[str] = []
         self.aborted: list[str] = []
         self._subscribers: set[asyncio.Queue[str]] = set()
         self._closing = False
@@ -113,6 +115,25 @@ class FakeOpencode:
     async def _get_messages(self, request: web.Request) -> web.Response:
         sid = request.match_info["sessionID"]
         return web.json_response(self.messages.get(sid, []))
+
+    async def _patch_session(self, request: web.Request) -> web.Response:
+        sid = request.match_info["sessionID"]
+        body = await request.json() if request.can_read_body else {}
+        session = self.sessions.get(sid)
+        if session is None:
+            return web.json_response({"error": "not found"}, status=404)
+        if "title" in body:
+            session["title"] = body["title"]
+        self.patches.append({"sid": sid, "title": body.get("title")})
+        return web.json_response(session)
+
+    async def _delete_session(self, request: web.Request) -> web.Response:
+        sid = request.match_info["sessionID"]
+        self.deletes.append(sid)
+        if self.sessions.pop(sid, None) is None:
+            return web.json_response({"error": "not found"}, status=404)
+        self.messages.pop(sid, None)
+        return web.json_response(True)
 
     async def _prompt_async(self, request: web.Request) -> web.Response:
         sid = request.match_info["sessionID"]
@@ -242,6 +263,8 @@ class FakeOpencode:
         app.router.add_get("/global/health", self._health)
         app.router.add_get("/session", self._list_sessions)
         app.router.add_post("/session", self._create_session)
+        app.router.add_patch("/session/{sessionID}", self._patch_session)
+        app.router.add_delete("/session/{sessionID}", self._delete_session)
         app.router.add_get("/session/{sessionID}/message", self._get_messages)
         app.router.add_post("/session/{sessionID}/prompt_async", self._prompt_async)
         app.router.add_post("/session/{sessionID}/abort", self._abort)

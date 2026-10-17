@@ -183,6 +183,17 @@ class OpencodeClient:
             json_body=body,
         )
 
+    async def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
+        """Retitle a session. opencode PATCHes it in place and returns the fresh object."""
+        data = await self._request(
+            "PATCH", f"/session/{session_id}", json_body={"title": title}
+        )
+        return data if isinstance(data, dict) else {}
+
+    async def delete_session(self, session_id: str) -> None:
+        """Remove a session and its messages for good. This is not undoable."""
+        await self._request("DELETE", f"/session/{session_id}")
+
     async def abort(self, session_id: str) -> None:
         await self._request("POST", f"/session/{session_id}/abort")
 

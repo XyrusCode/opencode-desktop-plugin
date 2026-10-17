@@ -246,6 +246,31 @@ class BridgeServer:
                 await self._client.prompt(
                     session_id, text, model=prompt_model, agent=prompt_agent
                 )
+            elif kind == p.RENAME_SESSION:
+                session_id = p.require(frame, "sessionID")
+                title = p.require(frame, "title").strip()
+                if not title:
+                    await self._send(socket, p.error("a session title cannot be empty"))
+                    return
+                updated = await self._client.rename_session(session_id, title)
+                # Echo it back so every paired phone converges without a full refresh.
+                await self._broadcast(
+                    {
+                        "type": p.SESSION,
+                        "kind": "renamed",
+                        "session": p.session_summary(updated),
+                    }
+                )
+            elif kind == p.DELETE_SESSION:
+                session_id = p.require(frame, "sessionID")
+                await self._client.delete_session(session_id)
+                # If the phone was reading that session, detach so the composer
+                # stops offering to send into a session that no longer exists.
+                if self._attached.get(socket) == session_id:
+                    self._attached.pop(socket, None)
+                await self._broadcast(
+                    {"type": p.SESSION, "kind": "deleted", "sessionID": session_id}
+                )
             elif kind == p.ABORT:
                 session_id = frame.get("sessionID") or self._attached.get(socket)
                 if not session_id:
