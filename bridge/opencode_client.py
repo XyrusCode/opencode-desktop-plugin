@@ -72,13 +72,16 @@ class OpencodeClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
         directory: str | None = None,
+        ignore_workdir: bool = False,
     ) -> Any:
         query = dict(params or {})
         # A per-call directory overrides the client's default workdir; this is
-        # how the phone creates a session in a project it picked.
+        # how the phone creates a session in a project it picked. ignore_workdir
+        # suppresses the default entirely, so a listing call spans every project
+        # instead of only the bridge's working directory.
         if directory is not None:
             query.setdefault("directory", directory)
-        elif self.workdir:
+        elif self.workdir and not ignore_workdir:
             query.setdefault("directory", self.workdir)
         try:
             async with self._http.request(
@@ -119,9 +122,24 @@ class OpencodeClient:
 
     # --- sessions --------------------------------------------------------
 
-    async def list_sessions(self, *, limit: int = 25) -> list[dict[str, Any]]:
-        data = await self._request("GET", "/session", params={"limit": limit})
+    async def list_sessions(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Sessions across every project, newest first.
+
+        One unscoped call spans all projects, and opencode caps the response at
+        whatever exists (a few hundred), so a high limit returns everything in a
+        single round trip. The cap is what used to hide projects: at 50 only 8
+        project folders came back, at 500 all 29 do.
+        Do NOT fan out into a per-project request per worktree: opencode serve
+        registers hundreds of worktrees and that many round trips saturates it
+        until /project times out.
+        The phone groups these by their real directory into projects.
+        """
+        data = await self._request("GET", "/session", params={"limit": limit}, ignore_workdir=True)
         return data if isinstance(data, list) else []
+
+    async def get_session(self, session_id: str) -> dict[str, Any]:
+        data = await self._request("GET", f"/session/{session_id}", ignore_workdir=True)
+        return data if isinstance(data, dict) else {}
 
     async def create_session(self, *, title: str = "", directory: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {}

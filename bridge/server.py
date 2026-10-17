@@ -223,6 +223,26 @@ class BridgeServer:
                 # is the only setter that works on current opencode builds.
                 prompt_model = self._model.pop(socket, None)
                 prompt_agent = self._agent.pop(socket, None)
+                # An existing session carries its own model/agent. When the phone
+                # has nothing selected (old session, nothing picked yet), carry the
+                # session's so a model-less prompt can never wedge it busy forever.
+                if prompt_model is None or prompt_agent is None:
+                    try:
+                        info = await self._client.get_session(session_id)
+                    except Exception:
+                        info = {}
+                    session_model = info.get("model") or {}
+                    if (
+                        prompt_model is None
+                        and isinstance(session_model, dict)
+                        and session_model.get("id")
+                    ):
+                        prompt_model = {
+                            "providerID": session_model.get("providerID", ""),
+                            "modelID": session_model["id"],
+                        }
+                    if prompt_agent is None and info.get("agent"):
+                        prompt_agent = info["agent"]
                 await self._client.prompt(
                     session_id, text, model=prompt_model, agent=prompt_agent
                 )
